@@ -53,18 +53,20 @@ public static class BlazeUtils
         );
     }
 
-    // model filtering utility
+    // model filtering utility (Face - NMS)
     static FunctionalTensor ScoreFiltering(FunctionalTensor rawScores, float scoreThreshold)
     {
         return Functional.Sigmoid(Functional.Clamp(rawScores, -scoreThreshold, scoreThreshold));
     }
 
-    public static (FunctionalTensor, FunctionalTensor, FunctionalTensor) NMSFiltering(FunctionalTensor rawBoxes, FunctionalTensor rawScores, FunctionalTensor anchors, float inputSize, float iouThreshold, float scoreThreshold)
+    public static (FunctionalTensor, FunctionalTensor, FunctionalTensor) NMSFiltering(
+        FunctionalTensor rawBoxes, FunctionalTensor rawScores, FunctionalTensor anchors,
+        float inputSize, float iouThreshold, float scoreThreshold)
     {
         var xCenter = rawBoxes[0, .., 0] + anchors[.., 0] * inputSize;
         var yCenter = rawBoxes[0, .., 1] + anchors[.., 1] * inputSize;
 
-        var widthHalf = 0.5f * rawBoxes[0, .., 2];
+        var widthHalf  = 0.5f * rawBoxes[0, .., 2];
         var heightHalf = 0.5f * rawBoxes[0, .., 3];
 
         var nmsBoxes = Functional.Stack(new[]
@@ -75,31 +77,46 @@ public static class BlazeUtils
             xCenter + widthHalf
         }, 1);
 
-        var nmsScores = Functional.Squeeze(ScoreFiltering(rawScores, 100f));
-        var selectedIndices = Functional.NMS(nmsBoxes, nmsScores, iouThreshold, scoreThreshold); // (N);
+        var nmsScores       = Functional.Squeeze(ScoreFiltering(rawScores, 100f));
+        var selectedIndices = Functional.NMS(nmsBoxes, nmsScores, iouThreshold, scoreThreshold); // (N)
 
-        var selectedBoxes = Functional.IndexSelect(rawBoxes, 1, selectedIndices).Unsqueeze(0); // (1, N, 16)
+        var selectedBoxes  = Functional.IndexSelect(rawBoxes, 1, selectedIndices).Unsqueeze(0); // (1, N, 16)
         var selectedScores = Functional.IndexSelect(rawScores, 1, selectedIndices).Unsqueeze(0); // (1, N, 1)
 
         return (selectedIndices, selectedScores, selectedBoxes);
     }
 
+    // model filtering utility (Hand/Pose - ArgMax: 가장 높은 점수 하나 선택)
+    public static (FunctionalTensor, FunctionalTensor, FunctionalTensor) ArgMaxFiltering(
+        FunctionalTensor rawBoxes, FunctionalTensor rawScores)
+    {
+        // rawScores: (1, N, 1) → squeeze → (N,) → argmax → scalar
+        var scores1D = Functional.Squeeze(ScoreFiltering(rawScores, 100f)); // (N,)
+        var bestIdx  = Functional.ArgMax(scores1D, 0, true);                // (1,)
+
+        // bestScore: (1,) → unsqueeze → (1, 1, 1)
+        var bestScore = Functional.Gather(scores1D.Unsqueeze(0), 1, bestIdx.Unsqueeze(0)).Unsqueeze(0); // (1,1,1)
+
+        // bestBox: select row from rawBoxes[0] shape (N, boxDim)
+        // IndexSelect on dim 1 of rawBoxes (1, N, boxDim) with bestIdx (1,)
+        var bestBox = Functional.IndexSelect(rawBoxes, 1, bestIdx); // (1, 1, boxDim)
+
+        return (bestIdx, bestScore, bestBox);
+    }
+
     // image transform utility
     static ComputeShader s_ImageTransformShader = Resources.Load<ComputeShader>("ComputeShaders/ImageTransform");
     static int s_ImageSample = s_ImageTransformShader.FindKernel("ImageSample");
-    static int s_Optr = Shader.PropertyToID("Optr");
-    static int s_X_tex2D = Shader.PropertyToID("X_tex2D");
-    static int s_O_height = Shader.PropertyToID("O_height");
-    static int s_O_width = Shader.PropertyToID("O_width");
-    static int s_O_channels = Shader.PropertyToID("O_channels");
-    static int s_X_height = Shader.PropertyToID("X_height");
-    static int s_X_width = Shader.PropertyToID("X_width");
+    static int s_Optr        = Shader.PropertyToID("Optr");
+    static int s_X_tex2D     = Shader.PropertyToID("X_tex2D");
+    static int s_O_height    = Shader.PropertyToID("O_height");
+    static int s_O_width     = Shader.PropertyToID("O_width");
+    static int s_O_channels  = Shader.PropertyToID("O_channels");
+    static int s_X_height    = Shader.PropertyToID("X_height");
+    static int s_X_width     = Shader.PropertyToID("X_width");
     static int s_affineMatrix = Shader.PropertyToID("affineMatrix");
 
-    static int IDivC(int v, int div)
-    {
-        return (v + div - 1) / div;
-    }
+    static int IDivC(int v, int div) => (v + div - 1) / div;
 
     public static void SampleImageAffine(Texture srcTexture, Tensor<float> dstTensor, float2x3 M)
     {
@@ -108,31 +125,50 @@ public static class BlazeUtils
         s_ImageTransformShader.SetTexture(s_ImageSample, s_X_tex2D, srcTexture);
         s_ImageTransformShader.SetBuffer(s_ImageSample, s_Optr, tensorData.buffer);
 
-        s_ImageTransformShader.SetInt(s_O_height, dstTensor.shape[1]);
-        s_ImageTransformShader.SetInt(s_O_width, dstTensor.shape[2]);
+        s_ImageTransformShader.SetInt(s_O_height,   dstTensor.shape[1]);
+        s_ImageTransformShader.SetInt(s_O_width,    dstTensor.shape[2]);
         s_ImageTransformShader.SetInt(s_O_channels, dstTensor.shape[3]);
-        s_ImageTransformShader.SetInt(s_X_height, srcTexture.height);
-        s_ImageTransformShader.SetInt(s_X_width, srcTexture.width);
+        s_ImageTransformShader.SetInt(s_X_height,   srcTexture.height);
+        s_ImageTransformShader.SetInt(s_X_width,    srcTexture.width);
 
-        s_ImageTransformShader.SetMatrix(s_affineMatrix, new Matrix4x4(new Vector4(M[0][0], M[0][1]), new Vector4(M[1][0], M[1][1]), new Vector4(M[2][0], M[2][1]), Vector4.zero));
+        s_ImageTransformShader.SetMatrix(s_affineMatrix,
+            new Matrix4x4(
+                new Vector4(M[0][0], M[0][1]),
+                new Vector4(M[1][0], M[1][1]),
+                new Vector4(M[2][0], M[2][1]),
+                Vector4.zero));
 
-        s_ImageTransformShader.Dispatch(s_ImageSample, IDivC(dstTensor.shape[1], 8), IDivC(dstTensor.shape[1], 8), 1);
+        s_ImageTransformShader.Dispatch(s_ImageSample,
+            IDivC(dstTensor.shape[1], 8),
+            IDivC(dstTensor.shape[1], 8), 1);
     }
 
-    public static float[,] LoadAnchors(string csv, int numAnchors)
+    // 공식 샘플과 동일: float[,] (numAnchors, 4) 형식
+    // anchors CSV 형식: x, y, w, h
+    public static float[,] LoadAnchors(string csvText, int numAnchors)
     {
-        var anchors = new float[numAnchors, 4];
-        var anchorLines = csv.Split('\n');
+        var anchors     = new float[numAnchors, 4];
+        var anchorLines = csvText.Split('\n');
 
-        for (var i = 0; i < numAnchors; i++)
+        for (var i = 0; i < numAnchors && i < anchorLines.Length; i++)
         {
             var anchorValues = anchorLines[i].Split(',');
-            for (var j = 0; j < 4; j++)
-            {
-                anchors[i, j] = float.Parse(anchorValues[j], CultureInfo.InvariantCulture);
-            }
+            for (var j = 0; j < 4 && j < anchorValues.Length; j++)
+                anchors[i, j] = float.Parse(anchorValues[j].Trim(), CultureInfo.InvariantCulture);
         }
-
         return anchors;
+    }
+
+    // Resources 경로 오버로드 (직접 csvText 전달 불가할 때)
+    public static float[,] LoadAnchors(string resourcePath)
+    {
+        var asset = Resources.Load<TextAsset>(resourcePath);
+        if (asset == null)
+        {
+            Debug.LogError($"[BlazeUtils] Anchors not found at Resources/{resourcePath}");
+            return new float[0, 4];
+        }
+        var lines = asset.text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        return LoadAnchors(asset.text, lines.Length);
     }
 }

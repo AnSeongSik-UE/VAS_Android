@@ -159,10 +159,11 @@ Android 앱 씬:
 |------|------|
 | Unity Editor | **6000.3.9f1** |
 | Sentis | **2.5.0** (Package Manager → Unity Registry) |
-| UniVRM | 0.128.x (GitHub Releases → `.unitypackage` Import) |
+| UniVRM | 0.128.x 이상 (1.0 버전도 가능) (GitHub Releases → `.unitypackage` Import) |
 | Android Build Support | Unity Hub → Installs → 모듈 추가 |
 | 최소 Android | API 24 (Android 7.0) |
 | 빌드 머신 | Windows 가능 (Mac 불필요) |
+| 서버 언어 (Go) | **[go.dev](https://go.dev/doc/install)** 에서 다운로드하여 설치 (1.20 이상 권장, 외부 패키지 설치 불필요) |
 
 ### Sentis 2.5.0 설치 방법
 
@@ -186,6 +187,9 @@ var tensor = new Tensor<float>(new TensorShape(1, 128, 128, 3));
 
 // 비블로킹 GPU readback (UE AsyncTask와 유사)
 using var result = await tensor.ReadbackAndCloneAsync();
+
+// 또는 즉각적인 데이터 다운로드 (Sentis 2.5 권장)
+float[] data = tensor.DownloadToArray();
 
 // 어파인 변환으로 텍스처 → 텐서 변환 (비율 유지)
 BlazeUtils.SampleImageAffine(texture, inputTensor, M);
@@ -584,7 +588,7 @@ public class BlazeFaceDetector : MonoBehaviour
       BoundingBox    = new Rect(cx - w * 0.5f, cy - h * 0.5f, w, h),
       Score          = bestScore,
       AnchorPosition = anchor,
-      RawBoxes       = boxes.ToReadOnlyArray().ToArray() // 0~15번 값 복사
+      RawBoxes       = boxes.DownloadToArray() // 0~15번 값 복사
     };
   }
 
@@ -976,40 +980,21 @@ public struct TrackingPacket
 {
   public Vector3 HeadRotation;
   public Vector3 HeadPosition;
+  public Vector3 LeftArmRotation;  // 추가
+  public Vector3 RightArmRotation; // 추가
   public float   Timestamp;
   public float[] BlendShapeValues;  // 길이 52 고정
 
-  // ARKit BlendShape 이름 → 배열 인덱스 (iPhone 버전과 동일 키 사용)
-  public static readonly Dictionary<string, int> BlendShapeIndex = new()
-  {
-    { "eyeBlinkLeft",        0 }, { "eyeBlinkRight",       1 },
-    { "eyeWideLeft",         2 }, { "eyeWideRight",        3 },
-    { "browDownLeft",        4 }, { "browDownRight",       5 },
-    { "browInnerUp",         6 }, { "browOuterUpLeft",     7 },
-    { "browOuterUpRight",    8 }, { "jawOpen",             9 },
-    { "jawLeft",            10 }, { "jawRight",           11 },
-    { "mouthSmileLeft",     12 }, { "mouthSmileRight",    13 },
-    { "mouthFrownLeft",     14 }, { "mouthFrownRight",    15 },
-    { "mouthFunnel",        16 }, { "mouthPucker",        17 },
-    { "mouthLeft",          18 }, { "mouthRight",         19 },
-    { "mouthRollUpper",     20 }, { "mouthRollLower",     21 },
-    { "mouthShrugUpper",    22 }, { "mouthShrugLower",    23 },
-    { "mouthOpen",          24 }, { "mouthClose",         25 },
-    { "mouthUpperUpLeft",   26 }, { "mouthUpperUpRight",  27 },
-    { "mouthLowerDownLeft", 28 }, { "mouthLowerDownRight",29 },
-    { "cheekPuffLeft",      30 }, { "cheekPuffRight",     31 },
-    { "cheekSquintLeft",    32 }, { "cheekSquintRight",   33 },
-    { "noseSneerLeft",      34 }, { "noseSneerRight",     35 },
-  };
-
-  // 236 bytes 고정 직렬화 (UE FArchive 직렬화와 동일 원리)
-  // 구조: HeadRot(12) + HeadPos(12) + Timestamp(4) + BlendShapes(52×4=208) = 236
+  // 260 bytes 고정 직렬화 (기존 236 + 24)
+  // 구조: HeadRot(12) + HeadPos(12) + LArm(12) + RArm(12) + Timestamp(4) + BlendShapes(208) = 260
   public byte[] Serialize()
   {
-    var buf = new byte[236];
+    var buf = new byte[260];
     int o   = 0;
     WriteV3(buf, ref o, HeadRotation);
     WriteV3(buf, ref o, HeadPosition);
+    WriteV3(buf, ref o, LeftArmRotation);
+    WriteV3(buf, ref o, RightArmRotation);
     WriteF(buf, ref o, Timestamp);
     BlendShapeValues ??= new float[52];
     foreach (float v in BlendShapeValues) WriteF(buf, ref o, v);
@@ -1023,6 +1008,8 @@ public struct TrackingPacket
     {
       HeadRotation     = ReadV3(buf, ref o),
       HeadPosition     = ReadV3(buf, ref o),
+      LeftArmRotation  = ReadV3(buf, ref o),
+      RightArmRotation = ReadV3(buf, ref o),
       Timestamp        = ReadF(buf, ref o),
       BlendShapeValues = new float[52],
     };
@@ -1202,7 +1189,7 @@ public class ServerStreamReceiver : MonoBehaviour
     byte[] initBytes = Encoding.UTF8.GetBytes("SUBSCRIBE");
     _client.Send(initBytes, initBytes.Length);
     
-    ReceiveLoopAsync().Forget(); // 메인 스레드 블로킹 안함
+    _ = ReceiveLoopAsync(); // 메인 스레드 블로킹 안함
   }
 
   private async Awaitable ReceiveLoopAsync()
@@ -1211,8 +1198,8 @@ public class ServerStreamReceiver : MonoBehaviour
     {
       var result = await _client.ReceiveAsync();
       
-      // 혹시라도 서버 재기동 시나리오 등에 의해 패킷이 깨져오면 무시
-      if(result.Buffer.Length < 236) continue; 
+      // 260바이트 미만 패킷은 무시 (Head/Arm Rot + BlendShapes)
+      if(result.Buffer.Length < 260) continue; 
       
       var packet = TrackingPacket.Deserialize(result.Buffer);
       mapper.Apply(packet); // 메인 렌더링 스레드에서 VRM 캐릭터 변경
@@ -1229,13 +1216,13 @@ public class ServerStreamReceiver : MonoBehaviour
 // VRMMapper.cs (PC 앱)
 // UE 비유: LiveLink에서 받은 트래킹 데이터를 MorphTarget/본에 적용하는 것과 동일
 using UnityEngine;
-using VRM;
+using UniVRM10;
 
 public class VRMMapper : MonoBehaviour
 {
-  // Inspector에서 VRM 아바타의 컴포넌트를 드래그 앤 드롭으로 연결
-  [SerializeField] private VRMBlendShapeProxy blendShapeProxy; // MorphTarget 파라미터
-  [SerializeField] private Animator           vrmAnimator;     // 본 접근용
+  // Inspector에서 VRM10 아바타의 최상단 컴포넌트를 드래그 앤 드롭으로 연결
+  [SerializeField] private Vrm10Instance vrmInstance; // Vrm10Instance 컴포넌트
+  [SerializeField] private Animator      vrmAnimator; // 본 접근용
   [SerializeField, Range(0f, 1f)] private float smoothing = 0.3f; // 움직임 부드럽게
 
   public void Apply(TrackingPacket p)
@@ -1243,21 +1230,29 @@ public class VRMMapper : MonoBehaviour
     if (p.BlendShapeValues == null) return;
     ApplyBlendShapes(p.BlendShapeValues);
     ApplyHeadRotation(p.HeadRotation);
-    blendShapeProxy.Apply(); // 변경 사항 적용 (UE의 SetMorphTarget 후 업데이트)
+    ApplyArmRotations(p.LeftArmRotation, p.RightArmRotation); // 추가
+  }
+
+  private void ApplyArmRotations(Vector3 lEuler, Vector3 rEuler)
+  {
+    var lArm = vrmAnimator.GetBoneTransform(HumanBodyBones.LeftUpperArm);
+    var rArm = vrmAnimator.GetBoneTransform(HumanBodyBones.RightUpperArm);
+    if (lArm != null) lArm.localRotation = Quaternion.Slerp(lArm.localRotation, Quaternion.Euler(lEuler), 1f - smoothing);
+    if (rArm != null) rArm.localRotation = Quaternion.Slerp(rArm.localRotation, Quaternion.Euler(rEuler) , 1f - smoothing);
   }
 
   private void ApplyBlendShapes(float[] v)
   {
-    // VRMBlendShapeProxy = UE의 SetMorphTarget과 동일
-    Set(BlendShapePreset.Blink_L,   Get(v, "eyeBlinkLeft"));
-    Set(BlendShapePreset.Blink_R,   Get(v, "eyeBlinkRight"));
-    Set(BlendShapePreset.A,         Mathf.Clamp01(Get(v, "jawOpen") * 1.2f));
-    Set(BlendShapePreset.O,         Mathf.Clamp01(Get(v, "mouthFunnel") + Get(v, "mouthPucker")));
-    Set(BlendShapePreset.U,         Mathf.Clamp01(Get(v, "mouthPucker") * 1.5f));
-    Set(BlendShapePreset.Joy,       (Get(v, "mouthSmileLeft") + Get(v, "mouthSmileRight")) * 0.5f);
-    Set(BlendShapePreset.Sorrow,    (Get(v, "mouthFrownLeft") + Get(v, "mouthFrownRight")) * 0.5f);
-    Set(BlendShapePreset.Surprised, Get(v, "browInnerUp"));
-    Set(BlendShapePreset.Angry,     (Get(v, "browDownLeft") + Get(v, "browDownRight")) * 0.5f);
+    // UniVRM10의 Expression 설정 로직
+    Set(ExpressionPreset.blinkLeft, Get(v, "eyeBlinkLeft"));
+    Set(ExpressionPreset.blinkRight,Get(v, "eyeBlinkRight"));
+    Set(ExpressionPreset.aa,        Mathf.Clamp01(Get(v, "jawOpen") * 1.2f));
+    Set(ExpressionPreset.oh,        Mathf.Clamp01(Get(v, "mouthFunnel") + Get(v, "mouthPucker")));
+    Set(ExpressionPreset.ou,        Mathf.Clamp01(Get(v, "mouthPucker") * 1.5f));
+    Set(ExpressionPreset.happy,     (Get(v, "mouthSmileLeft") + Get(v, "mouthSmileRight")) * 0.5f);
+    Set(ExpressionPreset.sad,       (Get(v, "mouthFrownLeft") + Get(v, "mouthFrownRight")) * 0.5f);
+    Set(ExpressionPreset.surprised, Get(v, "browInnerUp"));
+    Set(ExpressionPreset.angry,     (Get(v, "browDownLeft") + Get(v, "browDownRight")) * 0.5f);
   }
 
   private void ApplyHeadRotation(Vector3 euler)
@@ -1273,11 +1268,16 @@ public class VRMMapper : MonoBehaviour
     neck.localRotation = Quaternion.Slerp(neck.localRotation, target, 1f - smoothing);
   }
 
-  // 헬퍼: BlendShape 설정
-  private void Set(BlendShapePreset p, float v) =>
-    blendShapeProxy.ImmediatelySetValue(BlendShapeKey.CreateFromPreset(p), Mathf.Clamp01(v));
+  // 헬퍼: Expression (BlendShape) 설정
+  private void Set(ExpressionPreset p, float v)
+  {
+    if (vrmInstance != null && vrmInstance.Runtime != null)
+    {
+      vrmInstance.Runtime.Expression.SetWeight(ExpressionKey.CreateFromPreset(p), Mathf.Clamp01(v));
+    }
+  }
 
-  // 헬퍼: BlendShape 값 가져오기
+  // 헬퍼: 트래킹 패킷 값 가져오기
   private float Get(float[] v, string name) =>
     TrackingPacket.BlendShapeIndex.TryGetValue(name, out int i) ? v[i] : 0f;
 }
@@ -1326,7 +1326,7 @@ public class TrackingPipeline : MonoBehaviour
     cameraTexture = new WebCamTexture(640, 480, 30);
     cameraTexture.Play();
     _currentPacket = new TrackingPacket { BlendShapeValues = new float[52] };
-    UpdateLoop().Forget();
+    _ = UpdateLoop();
   }
 
   private async Awaitable UpdateLoop()
@@ -1420,6 +1420,10 @@ Project Settings > Player > Android
 Project Settings > Graphics
   └─ Vulkan을 목록 최상단으로 이동 (Sentis GPU 가속 향상)
 
+Android 최적화 가이드:
+  1. StreamingAssets 대신 Resources 시스템 사용 (안드로이드 파일 IO 문제 예방)
+  2. 전면 카메라(isFrontFacing) 자동 감지 로직 적용
+  
 Sentis BackendType 폴백 전략:
   GPUCompute (Vulkan) → 지원 안 되면 CPUCompute 자동 전환
 
@@ -1457,6 +1461,8 @@ Sentis BackendType 폴백 전략:
 ✅ Unity 6 내장 Awaitable 활용 (UniTask 의존성 없음)
 
 ✅ Golang과 Docker를 활용한 릴레이 서버 구축 경험 (Pub/Sub 패턴의 클라우드 초저지연 통신)
+
+✅ Android 특화 최적화 (Resources 로드 방식 전환으로 IO 에러 방지 및 전면 카메라 자동 지원)
 
 ✅ iPhone/Android 동일 TrackingPacket → PC 앱 100% 재사용 (DRY)
 
