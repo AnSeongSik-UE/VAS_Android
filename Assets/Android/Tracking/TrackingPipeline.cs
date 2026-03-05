@@ -17,6 +17,14 @@ public class TrackingPipeline : MonoBehaviour
     private WebCamTexture _cameraTexture;
     private TrackingPacket _currentPacket;
 
+    // Tracking points storage for persistent rendering
+    private Vector2[] _facePoints = new Vector2[6];
+    private float _faceTime = -1f;
+    private Vector2[] _handPoints = new Vector2[21];
+    private float _handTime = -1f;
+    private Vector2[] _posePoints = new Vector2[33];
+    private float _poseTime = -1f;
+
     void Start()
     {
         try 
@@ -109,10 +117,19 @@ public class TrackingPipeline : MonoBehaviour
         rt.anchoredPosition = Vector2.zero;
         rt.localEulerAngles = new Vector3(0, 0, -rotation);
 
-        float scaleX = uniformScale;
-        float scaleY = _cameraTexture.videoVerticallyMirrored ? -uniformScale : uniformScale;
+        // 카메라
+        float scaleX = uniformScale; 
+        float scaleY = -uniformScale; 
+        
+        // Android/Unity 특정 플래폼에서 Y축 반전이 필요한 경우 대응
+        //if (_cameraTexture.videoVerticallyMirrored) scaleY = uniformScale;
+        
         rt.localScale = new Vector3(scaleX, scaleY, 1f);
     }
+
+    private string _faceStatus = "<color=yellow><b>[FACE] OFF (YELLOW)</b></color>";
+    private string _handStatus = "<color=green><b>[HAND] OFF (GREEN)</b></color>";
+    private string _poseStatus = "<color=blue><b>[POSE] OFF (BLUE)</b></color>";
 
     private async Awaitable UpdateLoop()
     {
@@ -124,6 +141,13 @@ public class TrackingPipeline : MonoBehaviour
         {
             // Wait until camera is active
             if (!_cameraTexture.isPlaying) { await Awaitable.NextFrameAsync(); continue; }
+
+            // Ensure Rich Text is enabled for coloring and set alignment
+            if (debugText != null) 
+            {
+                debugText.richText = true;
+                debugText.parseCtrlCharacters = true;
+            }
 
             if (!layoutDone)
             {
@@ -140,8 +164,7 @@ public class TrackingPipeline : MonoBehaviour
                 if (faceDetector == null || handDetector == null || serverSender == null || 
                     handLandmarker == null || poseDetector == null || poseLandmarker == null)
                 {
-                    sb.AppendLine("Error: Missing Components!");
-                    if (debugText != null) debugText.text = sb.ToString();
+                    if (debugText != null) debugText.text = "Error: Missing Components!";
                     await Awaitable.NextFrameAsync();
                     continue;
                 }
@@ -154,63 +177,57 @@ public class TrackingPipeline : MonoBehaviour
                 {
                     case 0: // Face Detection
                         var face = await faceDetector.DetectAsync(_cameraTexture);
-                        _currentPacket.IsTracking = face.IsValid; // 얼굴이 감지되어야 트래킹 유효
-                        sb.AppendLine($"[FACE] {(face.IsValid ? "DETECTED" : "LOST")}");
+                        _currentPacket.IsTracking = face.IsValid;
+                        _faceStatus = face.IsValid ? "<color=yellow><b>[FACE] DETECTED (YELLOW)</b></color>" : "<color=yellow><b>[FACE] LOST (YELLOW)</b></color>";
                         if (face.IsValid && face.RawBoxes != null)
                         {
                             var bs = FaceKeyPointBlendShape.Calculate(face.RawBoxes); 
                             _currentPacket.BlendShapeValues[0] = bs.BlinkLeft;
                             _currentPacket.BlendShapeValues[1] = bs.BlinkRight;
-                            
-                            // 6개 주요 포인트 시각화
-                            DrawFacePoints(face);
+                            UpdateFacePoints(face);
                         }
-                        else { ClearDebugPoints(); }
                         break;
 
                     case 1: // Hand Tracking
                         var hand = await handDetector.DetectAsync(_cameraTexture);
+                        _handStatus = hand.IsValid ? "<color=green><b>[HAND] DETECTED (GREEN)</b></color>" : "<color=green><b>[HAND] LOST (GREEN)</b></color>";
                         if (hand.IsValid)
                         {
                             var handJoints = await handLandmarker.RunAsync(_cameraTexture, hand);
-                            DrawLandmarkPoints(handJoints, Color.green);
-                            sb.AppendLine("[HAND] DETECTED");
-                        }
-                        else
-                        {
-                            sb.AppendLine("[HAND] LOST");
-                            ClearDebugPoints();
+                            UpdateLandmarkPoints(handJoints, _handPoints, ref _handTime);
                         }
                         break;
 
                     case 2: // Pose Tracking
                         var pose = await poseDetector.DetectAsync(_cameraTexture);
+                        _poseStatus = pose.IsValid ? "<color=blue><b>[POSE] DETECTED (BLUE)</b></color>" : "<color=blue><b>[POSE] LOST (BLUE)</b></color>";
                         if (pose.IsValid)
                         {
                             var poseJoints = await poseLandmarker.RunAsync(_cameraTexture, pose);
                             if (poseJoints != null && poseJoints.Length >= 15)
                             {
                                 UpdatePoseData(poseJoints);
-                                DrawLandmarkPoints(poseJoints, Color.cyan);
-                                sb.AppendLine("[POSE] DETECTED");
+                                UpdateLandmarkPoints(poseJoints, _posePoints, ref _poseTime);
                             }
-                        }
-                        else
-                        {
-                            sb.AppendLine("[POSE] LOST");
-                            ClearDebugPoints();
                         }
                         break;
                 }
 
                 trackingSlot = (trackingSlot + 1) % 3;
 
-                // Network Send (FIRE AND FORGET to prevent 1-frame freeze)
+                // 통합 UI 업데이트 (3개 동시 표시)
+                sb.AppendLine(_faceStatus);
+                sb.AppendLine(_handStatus);
+                sb.AppendLine(_poseStatus);
+
+                // 통합 렌더링
+                RenderAllPoints();
+
+                // Network Send
                 if (serverSender != null)
                 {
                     _currentPacket.Timestamp = Time.time;
                     _ = serverSender.SendAsync(_currentPacket); 
-                    sb.AppendLine("[NET] OK");
                 }
 
                 float duration = (Time.realtimeSinceStartup - startTime) * 1000f;
@@ -232,28 +249,51 @@ public class TrackingPipeline : MonoBehaviour
     private List<UnityEngine.UI.Image> _pointPool = new();
     private int _activePointCount = 0;
 
-    private void DrawFacePoints(BlazeFaceDetector.FaceDetection face)
+    private void UpdateFacePoints(BlazeFaceDetector.FaceDetection face)
     {
-        ClearDebugPoints();
-        if (face.RawBoxes == null || face.RawBoxes.Count == 0) return;
+        if (face.RawBoxes == null || face.RawBoxes.Length == 0) return;
         
-        var box = face.RawBoxes[0]; // 첫 번째 얼굴 기준
+        // 첫 번째 얼굴 기준
         // BlazeFace는 6개 키포인트를 가짐 (눈, 코, 입, 귀)
         for (int i=0; i<6; i++)
         {
-            Vector2 kp = new Vector2(box.KeyPoints[i * 2], box.KeyPoints[i * 2 + 1]);
-            SetPoint(kp, Color.yellow);
+            var kpTensor = face.AnchorPosition + new Unity.Mathematics.float2(face.RawBoxes[4 + i * 2], face.RawBoxes[4 + i * 2 + 1]);
+            var kpTexture = BlazeUtils.mul(face.DetectorMatrix, kpTensor);
+            
+            _facePoints[i] = new Vector2(kpTexture.x / _cameraTexture.width, kpTexture.y / _cameraTexture.height);
         }
+        _faceTime = Time.time;
     }
 
-    private void DrawLandmarkPoints(Vector3[] joints, Color color)
+    private void UpdateLandmarkPoints(Vector3[] joints, Vector2[] outPoints, ref float outTime)
+    {
+        if (joints == null) return;
+        int count = Mathf.Min(joints.Length, outPoints.Length);
+        for (int i = 0; i < count; i++)
+        {
+            // Normalize texture space (pixels) -> normalized space (0~1)
+            outPoints[i] = new Vector2(joints[i].x / _cameraTexture.width, joints[i].y / _cameraTexture.height);
+        }
+        outTime = Time.time;
+    }
+
+    private void RenderAllPoints()
     {
         ClearDebugPoints();
-        if (joints == null) return;
-        foreach (var joint in joints)
+        float now = Time.time;
+        float timeout = 0.5f;
+
+        if (now - _faceTime < timeout)
         {
-            // Normalize image space (0~1) -> UI space
-            SetPoint(new Vector2(joint.x, joint.y), color);
+            for (int i = 0; i < 6; i++) SetPoint(_facePoints[i], Color.yellow);
+        }
+        if (now - _handTime < timeout)
+        {
+            for (int i = 0; i < 21; i++) SetPoint(_handPoints[i], Color.green);
+        }
+        if (now - _poseTime < timeout)
+        {
+            for (int i = 0; i < 33; i++) SetPoint(_posePoints[i], Color.blue);
         }
     }
 
@@ -269,6 +309,7 @@ public class TrackingPipeline : MonoBehaviour
             var go = new GameObject("DebugPoint", typeof(UnityEngine.UI.Image));
             go.transform.SetParent(displayImage.transform, false);
             img = go.GetComponent<UnityEngine.UI.Image>();
+            img.rectTransform.anchorMin = img.rectTransform.anchorMax = img.rectTransform.pivot = new Vector2(0.5f, 0.5f);
             img.rectTransform.sizeDelta = new Vector2(10, 10);
             _pointPool.Add(img);
         }
@@ -276,9 +317,9 @@ public class TrackingPipeline : MonoBehaviour
         img.gameObject.SetActive(true);
         img.color = color;
         
-        // UI 좌표계 mapping (디스플레이 이미지 크기 기준)
+        // 트래킹 포인트
         float x = (normPos.x - 0.5f) * displayImage.rectTransform.rect.width;
-        float y = (0.5f - normPos.y) * displayImage.rectTransform.rect.height; // Y flip
+        float y = (normPos.y - 0.5f) * displayImage.rectTransform.rect.height;
         img.rectTransform.anchoredPosition = new Vector2(x, y);
         
         _activePointCount++;

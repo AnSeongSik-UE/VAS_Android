@@ -20,11 +20,12 @@ public class BlazeFaceDetector : MonoBehaviour
 
     public struct FaceDetection
     {
-        public bool   IsValid;
-        public Rect   BoundingBox;
-        public float  Score;
-        public float2 AnchorPosition;
-        public float[] RawBoxes;
+        public bool     IsValid;
+        public Rect     BoundingBox;
+        public float    Score;
+        public float2   AnchorPosition;
+        public float[]  RawBoxes;
+        public float2x3 DetectorMatrix;
     }
 
     void Start()
@@ -60,7 +61,7 @@ public class BlazeFaceDetector : MonoBehaviour
         var scale = size / (float)INPUT_SIZE;
         var M = BlazeUtils.mul(
             BlazeUtils.TranslationMatrix(0.5f * (new Vector2(texture.width, texture.height) + new Vector2(-size, size))),
-            BlazeUtils.ScaleMatrix(new Vector2(scale, -scale))
+            BlazeUtils.ScaleMatrix(new Vector2(-scale, scale))
         );
 
         BlazeUtils.SampleImageAffine(texture, _inputTensor, M);
@@ -98,7 +99,8 @@ public class BlazeFaceDetector : MonoBehaviour
             BoundingBox    = new Rect(cx - w * 0.5f, cy - h * 0.5f, w, h),
             Score          = outputScores[0, 0, 0],
             AnchorPosition = new float2(_anchors[anchorIdx, 0], _anchors[anchorIdx, 1]),
-            RawBoxes       = rawValues
+            RawBoxes       = rawValues,
+            DetectorMatrix = M
         };
     }
 
