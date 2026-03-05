@@ -54,10 +54,7 @@ public class VRMMapper : MonoBehaviour
       // 1. 타임아웃 체크 (3초간 패킷 미수신 시)
       bool isTimeout = _hasPacket && (Time.time - _lastPacketTime > 3f);
       
-      // 2. 트래킹 상태 확인
-      bool shouldReturnToDefault = isTimeout || (_hasPacket && !_latestPacket.IsTracking);
-
-      if (shouldReturnToDefault)
+      if (isTimeout)
       {
           ReturnToInitialPose();
           LerpBlendShapes(new float[52]); 
@@ -66,10 +63,45 @@ public class VRMMapper : MonoBehaviour
 
       if (_hasPacket)
       {
-          LerpBlendShapes(_latestPacket.BlendShapeValues);
-          SlerpHeadRotation(_latestPacket.HeadRotation);
-          SlerpArmRotations(_latestPacket.LeftArmRotation, _latestPacket.RightArmRotation);
+          int mask = _latestPacket.IsTracking; 
+
+          // 2. 부위별 개별 처리
+          // 얼굴/BlendShape
+          if ((mask & 1) != 0) LerpBlendShapes(_latestPacket.BlendShapeValues);
+          else LerpBlendShapes(new float[52]);
+
+          // 머리 회전
+          if ((mask & 1) != 0) SlerpHeadRotation(_latestPacket.HeadRotation);
+          else SlerpHeadToDefault();
+
+          // 팔 회전 및 손가락
+          bool hasHand = (mask & 2) != 0;
+          bool hasPose = (mask & 4) != 0;
+          if (hasHand || hasPose) 
+          {
+              SlerpArmRotations(_latestPacket.LeftArmRotation, _latestPacket.RightArmRotation);
+              if (hasHand) UpdateFingerCurls(_latestPacket.LeftFingerCurls, _latestPacket.RightFingerCurls);
+          }
+          else 
+          {
+              SlerpArmsToDefault();
+          }
       }
+  }
+
+  private void SlerpHeadToDefault()
+  {
+      var neck = vrmAnimator.GetBoneTransform(HumanBodyBones.Neck);
+      if (neck != null) neck.localRotation = Quaternion.Slerp(neck.localRotation, _initialNeck, Time.deltaTime * lerpSpeed);
+  }
+
+  private void SlerpArmsToDefault()
+  {
+      var lArm = vrmAnimator.GetBoneTransform(HumanBodyBones.LeftUpperArm);
+      var rArm = vrmAnimator.GetBoneTransform(HumanBodyBones.RightUpperArm);
+      float t = Time.deltaTime * lerpSpeed;
+      if (lArm != null) lArm.localRotation = Quaternion.Slerp(lArm.localRotation, _initialLeftArm, t);
+      if (rArm != null) rArm.localRotation = Quaternion.Slerp(rArm.localRotation, _initialRightArm, t);
   }
 
   private void ReturnToInitialPose()
@@ -140,4 +172,40 @@ public class VRMMapper : MonoBehaviour
 
   private float Get(float[] v, string name) =>
     TrackingPacket.BlendShapeIndex.TryGetValue(name, out int i) ? v[i] : 0f;
+
+  private void UpdateFingerCurls(float[] left, float[] right)
+  {
+      if (left != null && left.Length >= 5) SlerpFingerBones(true, left);
+      if (right != null && right.Length >= 5) SlerpFingerBones(false, right);
+  }
+
+  private void SlerpFingerBones(bool isLeft, float[] curls)
+  {
+      float t = Time.deltaTime * lerpSpeed;
+      HumanBodyBones[][] fingerBones = isLeft ? new HumanBodyBones[][] {
+          new[] { HumanBodyBones.LeftThumbProximal, HumanBodyBones.LeftThumbIntermediate, HumanBodyBones.LeftThumbDistal },
+          new[] { HumanBodyBones.LeftIndexProximal, HumanBodyBones.LeftIndexIntermediate, HumanBodyBones.LeftIndexDistal },
+          new[] { HumanBodyBones.LeftMiddleProximal, HumanBodyBones.LeftMiddleIntermediate, HumanBodyBones.LeftMiddleDistal },
+          new[] { HumanBodyBones.LeftRingProximal, HumanBodyBones.LeftRingIntermediate, HumanBodyBones.LeftRingDistal },
+          new[] { HumanBodyBones.LeftLittleProximal, HumanBodyBones.LeftLittleIntermediate, HumanBodyBones.LeftLittleDistal }
+      } : new HumanBodyBones[][] {
+          new[] { HumanBodyBones.RightThumbProximal, HumanBodyBones.RightThumbIntermediate, HumanBodyBones.RightThumbDistal },
+          new[] { HumanBodyBones.RightIndexProximal, HumanBodyBones.RightIndexIntermediate, HumanBodyBones.RightIndexDistal },
+          new[] { HumanBodyBones.RightMiddleProximal, HumanBodyBones.RightMiddleIntermediate, HumanBodyBones.RightMiddleDistal },
+          new[] { HumanBodyBones.RightRingProximal, HumanBodyBones.RightRingIntermediate, HumanBodyBones.RightRingDistal },
+          new[] { HumanBodyBones.RightLittleProximal, HumanBodyBones.RightLittleIntermediate, HumanBodyBones.RightLittleDistal }
+      };
+
+      for (int i = 0; i < 5; i++)
+      {
+          float angle = curls[i] * 80f; // 최대 80도 굽힘
+          foreach (var boneId in fingerBones[i])
+          {
+              var bone = vrmAnimator.GetBoneTransform(boneId);
+              if (bone == null) continue;
+              // VRM 축 기준: Z 또는 X축 굽힘 (여기서는 기본 -angle/angle 사용)
+              bone.localRotation = Quaternion.Slerp(bone.localRotation, Quaternion.Euler(0, 0, isLeft ? angle : -angle), t);
+          }
+      }
+  }
 }

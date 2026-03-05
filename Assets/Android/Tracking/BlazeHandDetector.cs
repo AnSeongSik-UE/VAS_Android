@@ -46,60 +46,78 @@ public class BlazeHandDetector : MonoBehaviour
         _anchors = handAnchorsCSV != null ? BlazeUtils.LoadAnchors(handAnchorsCSV.text, NUM_ANCHORS) : BlazeUtils.LoadAnchors("Data/hand_anchors");
     }
 
-    public async Awaitable<HandDetection> DetectAsync(WebCamTexture texture)
+    public async Awaitable<HandDetection[]> DetectMultiAsync(WebCamTexture texture)
     {
-        if (_worker == null || _inputTensor == null || _anchors == null)
-            return new HandDetection { IsValid = false };
-
         var size  = Mathf.Max(texture.width, texture.height);
         var scale = size / (float)DETECTOR_SIZE;
         var M = BlazeUtils.mul(
             BlazeUtils.TranslationMatrix(0.5f * (new Vector2(texture.width, texture.height) + new Vector2(-size, size))),
             BlazeUtils.ScaleMatrix(new Vector2(scale, -scale))
         );
+        return await RunWorkerAsync(texture, M);
+    }
+
+    public async Awaitable<HandDetection[]> DetectROIAsync(WebCamTexture texture, float2 center, float size)
+    {
+        var scale = size / (float)DETECTOR_SIZE;
+        var M = BlazeUtils.mul(
+            BlazeUtils.TranslationMatrix(center - new float2(size * 0.5f)),
+            BlazeUtils.ScaleMatrix(new Vector2(scale, -scale))
+        );
+        return await RunWorkerAsync(texture, M);
+    }
+
+    private async Awaitable<HandDetection[]> RunWorkerAsync(WebCamTexture texture, float2x3 M)
+    {
+        if (_worker == null || _inputTensor == null || _anchors == null) return null;
+
         BlazeUtils.SampleImageAffine(texture, _inputTensor, M);
         _worker.Schedule(_inputTensor);
 
         var t0 = _worker.PeekOutput(0) as Tensor<int>;
         var t1 = _worker.PeekOutput(1) as Tensor<float>;
         var t2 = _worker.PeekOutput(2) as Tensor<float>;
-
-        if (t0 == null || t1 == null || t2 == null) return new HandDetection { IsValid = false };
+        if (t0 == null || t1 == null || t2 == null) return null;
 
         using var outputIdx   = await t0.ReadbackAndCloneAsync();
         using var outputScore = await t1.ReadbackAndCloneAsync();
         using var outputBox   = await t2.ReadbackAndCloneAsync();
 
-        if (outputIdx == null || outputScore == null || outputBox == null || outputScore.shape.length == 0)
-            return new HandDetection { IsValid = false };
+        if (outputIdx == null || outputScore == null || outputBox == null || outputScore.shape.length == 0) return null;
 
-        if (outputScore[0] < SCORE_THRESH) return new HandDetection { IsValid = false };
-
-        int idx = outputIdx[0];
-        if (idx < 0 || idx >= NUM_ANCHORS) return new HandDetection { IsValid = false };
-
-        var anchorPosition = DETECTOR_SIZE * new float2(_anchors[idx, 0], _anchors[idx, 1]);
-        var boxCentre = anchorPosition + new float2(outputBox[0, 0, 0], outputBox[0, 0, 1]);
-        var boxSize   = math.max(outputBox[0, 0, 2], outputBox[0, 0, 3]);
-
-        var kp0 = anchorPosition + new float2(outputBox[0, 0, 4], outputBox[0, 0, 5]);
-        var kp2 = anchorPosition + new float2(outputBox[0, 0, 8], outputBox[0, 0, 9]);
-        var delta = kp2 - kp0;
-        var up    = delta / math.length(delta);
-        var theta = math.atan2(delta.y, delta.x);
-        var rotation = 0.5f * Mathf.PI - theta;
-
-        var center  = boxCentre + 0.5f * boxSize * up;
-        var sizeOut = boxSize * 2.6f;
-
-        return new HandDetection
+        var results = new System.Collections.Generic.List<HandDetection>();
+        for (int i = 0; i < outputIdx.shape.length && i < 2; i++)
         {
-            IsValid           = true,
-            CenterTensorSpace = center,
-            SizeTensorSpace   = sizeOut,
-            Rotation          = rotation,
-            DetectorMatrix    = M
-        };
+            if (outputScore[i] < SCORE_THRESH) break;
+            int idx = outputIdx[i];
+            if (idx < 0 || idx >= NUM_ANCHORS) continue;
+
+            var anchorPos = DETECTOR_SIZE * new float2(_anchors[idx, 0], _anchors[idx, 1]);
+            var boxCentre = anchorPos + new float2(outputBox[0, i, 0], outputBox[0, i, 1]);
+            var boxSize   = math.max(outputBox[0, i, 2], outputBox[0, i, 3]);
+
+            var kp0 = anchorPos + new float2(outputBox[0, i, 4], outputBox[0, i, 5]);
+            var kp2 = anchorPos + new float2(outputBox[0, i, 8], outputBox[0, i, 9]);
+            
+            var delta = kp2 - kp0;
+            var up    = delta / (math.length(delta) + 0.0001f);
+            var rotation = 0.5f * Mathf.PI - math.atan2(delta.y, delta.x);
+
+            var center  = boxCentre + 0.5f * boxSize * up;
+            var sizeOut = boxSize * 2.6f;
+
+            results.Add(new HandDetection {
+                IsValid = true, CenterTensorSpace = center, SizeTensorSpace = sizeOut,
+                Rotation = rotation, DetectorMatrix = M
+            });
+        }
+        return results.Count > 0 ? results.ToArray() : null;
+    }
+
+    public async Awaitable<HandDetection> DetectAsync(WebCamTexture texture)
+    {
+        var all = await DetectMultiAsync(texture);
+        return (all != null && all.Length > 0) ? all[0] : new HandDetection { IsValid = false };
     }
 
     void OnDestroy() { _worker?.Dispose(); _inputTensor?.Dispose(); }

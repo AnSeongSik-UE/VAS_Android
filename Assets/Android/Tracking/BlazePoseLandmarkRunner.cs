@@ -73,7 +73,7 @@ public class BlazePoseLandmarkRunner : MonoBehaviour
             for (int i = 0; i < 33; i++)
             {
                 var pos = BlazeUtils.mul(M2, new float2(output[0, i * 5], output[0, i * 5 + 1]));
-                joints[i] = new Vector3(pos.x, pos.y, output[0, i * 5 + 3]); // z = visibility
+                joints[i] = new Vector3(pos.x, pos.y, output[0, i * 5 + 2]); // z = depth (2), not visibility (3)
             }
         }
         else if (rank == 3)
@@ -82,7 +82,7 @@ public class BlazePoseLandmarkRunner : MonoBehaviour
             for (int i = 0; i < 33; i++)
             {
                 var pos = BlazeUtils.mul(M2, new float2(output[0, i, 0], output[0, i, 1]));
-                joints[i] = new Vector3(pos.x, pos.y, output[0, i, 3]); // z = visibility
+                joints[i] = new Vector3(pos.x, pos.y, output[0, i, 2]); // z = depth (2), not visibility (3)
             }
         }
 

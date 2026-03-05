@@ -14,8 +14,10 @@ public struct TrackingPacket
   public Vector3 RightArmRotation; // 추가: 우측 팔 회전
   public float   Timestamp;
   public float[] BlendShapeValues;  // 길이 52 고정
+  public float[] LeftFingerCurls;   // 추가: [5] (엄지~소지 굽힘도 0~1)
+  public float[] RightFingerCurls;  // 추가: [5]
 
-  public bool    IsTracking; // 추가: 트래킹 유지/로스트 상태
+  public byte    IsTracking; // 비트마스크 (0:None, 1:Face, 2:Hand, 4:Pose)
 
   // ARKit BlendShape 이름 → 배열 인덱스 (iPhone 버전과 동일 키 사용)
   public static readonly Dictionary<string, int> BlendShapeIndex = new()
@@ -40,20 +42,28 @@ public struct TrackingPacket
     { "noseSneerLeft",      34 }, { "noseSneerRight",     35 },
   };
 
-  // 261 bytes 고정 직렬화 (기존 260 + bool 1)
-  // 구조: HeadRot(12) + HeadPos(12) + LArm(12) + RArm(12) + Timestamp(4) + BlendShapes(208) + IsTracking(1) = 261
+  // 301 bytes 고정 직렬화
+  // 구조: HeadRot(12) + HeadPos(12) + LArm(12) + RArm(12) + Timestamp(4) + BlendShapes(208) + LFingers(20) + RFingers(20) + IsTracking(1) = 301
   public byte[] Serialize()
   {
-    var buf = new byte[261];
+    var buf = new byte[301];
     int o   = 0;
     WriteV3(buf, ref o, HeadRotation);
     WriteV3(buf, ref o, HeadPosition);
     WriteV3(buf, ref o, LeftArmRotation);
     WriteV3(buf, ref o, RightArmRotation);
     WriteF(buf, ref o, Timestamp);
+    
     BlendShapeValues ??= new float[52];
     foreach (float v in BlendShapeValues) WriteF(buf, ref o, v);
-    buf[o++] = IsTracking ? (byte)1 : (byte)0;
+    
+    LeftFingerCurls ??= new float[5];
+    foreach (float v in LeftFingerCurls) WriteF(buf, ref o, v);
+    
+    RightFingerCurls ??= new float[5];
+    foreach (float v in RightFingerCurls) WriteF(buf, ref o, v);
+    
+    buf[o++] = IsTracking;
     return buf;
   }
 
@@ -70,7 +80,14 @@ public struct TrackingPacket
       BlendShapeValues = new float[52],
     };
     for (int i = 0; i < 52; i++) p.BlendShapeValues[i] = ReadF(buf, ref o);
-    p.IsTracking = o < buf.Length && buf[o++] != 0;
+    
+    p.LeftFingerCurls = new float[5];
+    for (int i = 0; i < 5; i++) p.LeftFingerCurls[i] = ReadF(buf, ref o);
+    
+    p.RightFingerCurls = new float[5];
+    for (int i = 0; i < 5; i++) p.RightFingerCurls[i] = ReadF(buf, ref o);
+    
+    p.IsTracking = o < buf.Length ? buf[o++] : (byte)0;
     return p;
   }
 

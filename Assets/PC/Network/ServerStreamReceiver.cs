@@ -32,8 +32,8 @@ public class ServerStreamReceiver : MonoBehaviour
     {
       var result = await _client.ReceiveAsync();
       
-      // 261바이트 미만 패킷은 무시 (Head/Arm Rot + BlendShapes + IsTracking)
-      if(result.Buffer.Length < 261) continue; 
+      // 301바이트 미만 패킷은 무시 (Head/Arm Rot + Fingers + BlendShapes + IsTracking)
+      if(result.Buffer.Length < 301) continue; 
       
       var packet = TrackingPacket.Deserialize(result.Buffer);
       mapper.Apply(packet); // 메인 렌더링 스레드에서 VRM 캐릭터 변경
